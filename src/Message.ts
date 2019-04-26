@@ -209,7 +209,7 @@ export class Message<T = {}> {
             if (!isNullOrUndefined(this._route._answerTimers)) {
                 pull(this._route._answerTimers, this._expireTimer);
             }
-            this._messaging.getEventEmitter().emit('message.timeout', new CustomError(`Expected an answer within ${ttl}ms`), this);
+            this._messaging.eventEmitter.emit('message.timeout', new CustomError(`Expected an answer within ${ttl}ms`), this);
         }, ttl);
         if (!isNullOrUndefined(this._route._answerTimers)) {
             this._route._answerTimers.push(this._expireTimer);

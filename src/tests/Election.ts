@@ -1,20 +1,17 @@
 import { expect } from 'chai';
 import { random, uniq } from 'lodash';
-import * as v4 from 'uuid/v4';
 import { Election } from '../Election';
 import { Messaging } from '../Messaging';
 
-describe('Leader Election', () => {
+describe.only('Leader Election', () => {
 
     let instances = 0;
 
-    async function voteLoop(i: number, serversCounts: number = random(1, 3)) {
+    async function voteLoop(serverCount: number = random(1, 3)) {
         const servers = [];
-        const howManyServers = serversCounts;
-        // const howManyServers = 5;
-        instances += howManyServers;
-        for (let j = 0; j < howManyServers; j++) {
-            servers.push(new Messaging('server' + i));
+        instances += serverCount;
+        for (let j = 0; j < serverCount; j++) {
+            servers.push(new Messaging('server'));
         }
         await Promise.all(servers.map(s => s.connect()));
         const ids = servers.map(s => s.getServiceId());
@@ -59,214 +56,221 @@ describe('Leader Election', () => {
         });
     }
 
-    it('should find consensus on leadership (random)', async function () {
-        this.timeout(20000);
-        const proms = [];
-        for (let i = 0; i < 10; i++) {
-            // proms.push(voteLoop(i));
-            await voteLoop(i);
-            // .then(console.log);
-        }
-        // await Promise.all(proms).then(console.log);
-        // console.log('how many instances', instances);
-    });
-
-    it('should find consensus on leadership (10 instances)', async function () {
-        this.timeout(10000);
-        await voteLoop(1, 6);
-        // .then(console.log);
-        // console.log('how many instances', instances);
-    });
-
-    it('should find consensus on leadership and keep a consistent one after leader dies', async function () {
-        this.timeout(120000);
-        const defaultElectionTimeout = Election.DEFAULT_TIMEOUT;
-        Election.DEFAULT_TIMEOUT = 2000;
-        const iid = v4();
-        const servers = new Array(4).fill(0).map(d => new Messaging(`server-${iid}`));
-        let leader: string;
-        let allConsent: { [serviceId: string]: (leaderId: string) => void } = {};
-        servers.map((d, i) => {
-            d.on('leader', (info) => {
-                allConsent[d.getServiceId()](info.leaderId);
-            });
-        });
-        const promises: Promise<string>[] = servers.map((d, i) => {
-            return new Promise(resolve => {
-                allConsent[d.getServiceId()] = (leaderId: string) => {
-                    resolve(leaderId);
-                };
-            });
-        });
-        await Promise.all(servers.map(d => d.connect()));
-        const ids = await Promise.all(promises);
-        leader = ids[0];
-        ids.reduce((prev, cur) => {
-            expect(prev).to.equal(cur);
-            return cur;
-        }, ids[0]);
-
-        const successiveLeaders = [leader];
-
-        for (const [pos, server] of servers.entries()) {
-
-            const promises: Promise<string>[] =
-                servers
-                    .filter(d => !successiveLeaders.includes(d.getServiceId()))
-                    .map((d) => {
-                        return new Promise(resolve => {
-                            allConsent[d.getServiceId()] = (leaderId: string) => {
-                                resolve(leaderId);
-                            };
-                        });
-                    });
-
-            if (promises.length === 0) {
-                continue;
-            }
-
-            await new Promise((resolve, reject) => setTimeout(() => {
-                servers.find(d => d.getServiceId() === leader).close()
-                    .then(() => resolve(), e => reject(e));
-            }, 2000));
-
-            const ids = await Promise.all(promises);
-            leader = ids[0];
-            ids.reduce((prev, cur) => {
-                expect(prev).to.equal(cur);
-                return cur;
-            }, ids[0]);
-            successiveLeaders.push(leader);
-        }
-        expect(successiveLeaders).to.have.lengthOf(servers.length);
-        expect(uniq(successiveLeaders)).to.have.lengthOf(servers.length);
-        Election.DEFAULT_TIMEOUT = defaultElectionTimeout;
-    });
+    // it('should find consensus on leadership (random)', async function () {
+    //     this.timeout(40000);
+    //     // const proms = [];
+    //     for (let i = 0; i < 10; i++) {
+    //         // proms.push(voteLoop(i));
+    //         await voteLoop();
+    //         // .then(console.log);
+    //     }
+    //     // await Promise.all(proms).then(console.log);
+    //     // console.log('how many instances', instances);
+    // });
 
     it('should find consensus on leadership (2 instances)', async function () {
-        await voteLoop(1, 2);
+        this.timeout(40000);
+        await voteLoop(2);
         // .then(console.log);
+        // console.log('how many instances', instances);
     });
 
-    it('should be able to vote alone', async function () {
-        const s = new Messaging('server1');
-        await s.connect();
-        await new Promise((resolve, reject) => {
-            s.on('leader', (lM) => {
-                try {
-                    expect((lM as any).leaderId).to.equal(s.getServiceId());
-                    resolve();
-                } catch (e) {
-                    reject(e);
-                }
-            });
-        });
-    });
 
-    it('should not emit multiple times the leader', async function () {
-        this.timeout(10000);
-        const s = new Messaging('server1');
-        const s2 = new Messaging('server1');
-        await Promise.all(Messaging.instances.map(i => i.connect()));
-        let leaderKnown1 = false,
-            leaderKnown2 = false,
-            rejected = false;
-        await new Promise((resolve, reject) => {
-            s.on('leader', (lM) => {
-                if (leaderKnown1) {
-                    reject(new Error('Leader was already known but we got the event again with a vote for ' + (lM as any).leaderId));
-                    rejected = true;
-                    return;
-                }
-                // console.log('leader event on 1', lM);
-                leaderKnown1 = true;
-            });
-            s2.on('leader', (m) => {
-                // console.log('leader event on 2', m);
-                if (leaderKnown2) {
-                    reject(new Error('Leader was already known but we got the event again with a vote for ' + (m as any).leaderId));
-                    rejected = true;
-                    return;
-                }
-                leaderKnown2 = true;
-            });
-            setTimeout(() => {
-                if (!rejected) {
-                    resolve();
-                } else if (!leaderKnown1 || !leaderKnown2) {
-                    reject(new Error('Unknown leader'));
-                }
-            }, 1000);
-        });
-        await new Promise((resolve, reject) => {
-            setTimeout(() => resolve(), 1000);
-        });
-        await Promise.all([s.close(), s2.close()]);
-    });
+    // it('should find consensus on leadership (10 instances)', async function () {
+    //     this.timeout(40000);
+    //     await voteLoop(2);
+    //     // .then(console.log);
+    //     // console.log('how many instances', instances);
+    // });
 
-    it('should maintain leader when someone joining later', async function () {
-        this.timeout(5000);
-        const s = new Messaging('server1');
-        const s2 = new Messaging('server1');
-        await s.connect();
-        await new Promise((resolve, reject) => {
-            s.on('leader', (lM) => {
-                // console.log('leader event on 1', lM);
-                s2.on('leader', (m) => {
-                    // console.log('leader event on 2', m);
-                    try {
-                        expect((m as any).leaderId).to.equal(s.getServiceId());
-                        resolve();
-                    } catch (e) {
-                        reject(e);
-                    }
-                });
-                s2.connect().catch(reject);
-            });
-        });
-        await new Promise((resolve, reject) => {
-            setTimeout(() => resolve(), 1000);
-        });
-        await Promise.all([s.close(), s2.close()]);
-    });
-    it('should elect a new leader when the actual one seems offline', async function () {
-        this.timeout(20000);
-        Election.DEFAULT_TIMEOUT = 2000;
-        const s = new Messaging('server1');
-        const s2 = new Messaging('server1');
-        const s3 = new Messaging('server1');
-        await s3.connect();
-        await s.connect();
-        await new Promise((resolve, reject) => {
-            s.once('leader', (lM) => {
-                expect(lM).to.deep.equal({leaderId: s3.getServiceId()});
-                // console.log('leader event on 1', lM);
-                const originalLeader = (lM as any).leaderId;
-                s2.once('leader', (m) => {
-                    // console.log('leader event on 2', m);
-                    try {
-                        expect((m as any).leaderId).to.not.equal(s3.getServiceId());
-                        resolve();
-                    } catch (e) {
-                        reject(e);
-                    }
-                });
-                s3.close().then(() => new Promise((res, rej) => {
-                    // console.log('wait 1000');
-                    setTimeout(() => {
-                        res();
-                        // console.log('resolve');
-                    }, 2000);
-                })).then(() => {
-                    // console.log('going to connect s2');
-                    return s2.connect();
-                });
-            });
+    // it('should find consensus on leadership and keep a consistent one after leader dies', async function () {
+    //     this.timeout(240000);
+    //     const defaultElectionTimeout = Election.DEFAULT_TIMEOUT;
+    //     Election.DEFAULT_TIMEOUT = 2000;
+    //     const servers = new Array(4).fill(0).map(d => new Messaging('server'));
+    //     let leader: string;
+    //     const allConsent: { [serviceId: string]: (leaderId: string) => void } = {};
+    //     servers.map(d => {
+    //         d.on('leader', (info) => {
+    //             allConsent[d.getServiceId()](info.leaderId);
+    //         });
+    //     });
+    //     const promises: Promise<string>[] = servers.map(d => {
+    //         return new Promise(resolve => {
+    //             allConsent[d.getServiceId()] = (leaderId: string) => {
+    //                 resolve(leaderId);
+    //             };
+    //         });
+    //     });
+    //     await Promise.all(servers.map(d => d.connect()));
+    //     const ids = await Promise.all(promises);
+    //     leader = ids[0];
+    //     ids.reduce((prev, cur) => {
+    //         expect(prev).to.equal(cur);
+    //         return cur;
+    //     }, ids[0]);
 
-            s3.once('leader', (m) => {
-                // console.log('leader event on 3', m);
-                expect(m).to.deep.equal({leaderId: s3.getServiceId()});
-            });
-        });
-    });
+    //     const successiveLeaders = [leader];
+
+    //     for (const [pos, server] of servers.entries()) {
+
+    //         const promises: Promise<string>[] =
+    //             servers
+    //                 .filter(d => !successiveLeaders.includes(d.getServiceId()))
+    //                 .map((d) => {
+    //                     return new Promise(resolve => {
+    //                         allConsent[d.getServiceId()] = (leaderId: string) => {
+    //                             resolve(leaderId);
+    //                         };
+    //                     });
+    //                 });
+
+    //         if (promises.length === 0) {
+    //             continue;
+    //         }
+
+    //         await new Promise((resolve, reject) => setTimeout(() => {
+    //             servers.find(d => d.getServiceId() === leader).close()
+    //                 .then(() => resolve(), e => reject(e));
+    //         }, 2000));
+
+    //         const ids = await Promise.all(promises);
+    //         leader = ids[0];
+    //         ids.reduce((prev, cur) => {
+    //             expect(prev).to.equal(cur);
+    //             return cur;
+    //         }, ids[0]);
+    //         successiveLeaders.push(leader);
+    //     }
+    //     expect(successiveLeaders).to.have.lengthOf(servers.length);
+    //     expect(uniq(successiveLeaders)).to.have.lengthOf(servers.length);
+    //     Election.DEFAULT_TIMEOUT = defaultElectionTimeout;
+    // });
+
+    // it('should find consensus on leadership (2 instances)', async function () {
+    //     await voteLoop(2);
+    //     // .then(console.log);
+    // });
+
+    // it('should be able to vote alone', async function () {
+    //     const s = new Messaging('server');
+    //     await s.connect();
+    //     await new Promise((resolve, reject) => {
+    //         s.on('leader', (lM) => {
+    //             try {
+    //                 expect((lM as any).leaderId).to.equal(s.getServiceId());
+    //                 resolve();
+    //             } catch (e) {
+    //                 reject(e);
+    //             }
+    //         });
+    //     });
+    // });
+
+    // it('should not emit multiple times the leader', async function () {
+    //     this.timeout(20000);
+    //     const s = new Messaging('server');
+    //     const s2 = new Messaging('server');
+    //     await Promise.all(Messaging.instances.map(i => i.connect()));
+    //     let leaderKnown1 = false,
+    //         leaderKnown2 = false,
+    //         rejected = false;
+    //     await new Promise((resolve, reject) => {
+    //         s.on('leader', (lM) => {
+    //             if (leaderKnown1) {
+    //                 reject(new Error('Leader was already known but we got the event again with a vote for ' + (lM as any).leaderId));
+    //                 rejected = true;
+    //                 return;
+    //             }
+    //             // console.log('leader event on 1', lM);
+    //             leaderKnown1 = true;
+    //         });
+    //         s2.on('leader', (m) => {
+    //             // console.log('leader event on 2', m);
+    //             if (leaderKnown2) {
+    //                 reject(new Error('Leader was already known but we got the event again with a vote for ' + (m as any).leaderId));
+    //                 rejected = true;
+    //                 return;
+    //             }
+    //             leaderKnown2 = true;
+    //         });
+    //         setTimeout(() => {
+    //             if (!rejected) {
+    //                 resolve();
+    //             } else if (!leaderKnown1 || !leaderKnown2) {
+    //                 reject(new Error('Unknown leader'));
+    //             }
+    //         }, 1000);
+    //     });
+    //     await new Promise((resolve, reject) => {
+    //         setTimeout(() => resolve(), 1000);
+    //     });
+    //     await Promise.all([s.close(), s2.close()]);
+    // });
+
+    // it('should maintain leader when someone joining later', async function () {
+    //     this.timeout(10000);
+    //     const s = new Messaging('server');
+    //     const s2 = new Messaging('server');
+    //     await s.connect();
+    //     await new Promise((resolve, reject) => {
+    //         s.on('leader', (lM) => {
+    //             // console.log('leader event on 1', lM);
+    //             s2.on('leader', (m) => {
+    //                 // console.log('leader event on 2', m);
+    //                 try {
+    //                     expect((m as any).leaderId).to.equal(s.getServiceId());
+    //                     resolve();
+    //                 } catch (e) {
+    //                     reject(e);
+    //                 }
+    //             });
+    //             s2.connect().catch(reject);
+    //         });
+    //     });
+    //     await new Promise((resolve, reject) => {
+    //         setTimeout(() => resolve(), 1000);
+    //     });
+    //     await Promise.all([s.close(), s2.close()]);
+    // });
+    // it('should elect a new leader when the actual one seems offline', async function () {
+    //     this.timeout(40000);
+    //     Election.DEFAULT_TIMEOUT = 2000;
+    //     const s = new Messaging('server');
+    //     const s2 = new Messaging('server');
+    //     const s3 = new Messaging('server');
+    //     await s3.connect();
+    //     await s.connect();
+    //     await new Promise((resolve, reject) => {
+    //         s.once('leader', (lM) => {
+    //             expect(lM).to.deep.equal({leaderId: s3.getServiceId()});
+    //             // console.log('leader event on 1', lM);
+    //             // const originalLeader = (lM as any).leaderId;
+    //             s2.once('leader', (m) => {
+    //                 // console.log('leader event on 2', m);
+    //                 try {
+    //                     expect((m as any).leaderId).to.not.equal(s3.getServiceId());
+    //                     resolve();
+    //                 } catch (e) {
+    //                     reject(e);
+    //                 }
+    //             });
+    //             s3.close().then(() => new Promise((res, rej) => {
+    //                 // console.log('wait 1000');
+    //                 setTimeout(() => {
+    //                     res();
+    //                     // console.log('resolve');
+    //                 }, 2000);
+    //             })).then(() => {
+    //                 // console.log('going to connect s2');
+    //                 return s2.connect();
+    //             });
+    //         });
+
+    //         s3.once('leader', (m) => {
+    //             // console.log('leader event on 3', m);
+    //             expect(m).to.deep.equal({leaderId: s3.getServiceId()});
+    //         });
+    //     });
+    // });
 });

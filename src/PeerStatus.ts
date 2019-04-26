@@ -32,14 +32,15 @@ export class PeerStatus {
 
     constructor(messaging: Messaging, logger: Logger) {
         this._messaging = messaging;
-        this._amqpLatency = new AMQPLatency(this._messaging);
+        this._amqpLatency = messaging.amqpLatency;
+        this._election = messaging.election;
         this._logger = logger;
         this._peers = new Map();
         this._listenersBinding.push(
-            this._messaging.listen(this._messaging.getInternalExchangeName(), 'peer.alive', (m: Message<PeerStat>) => {
+            this._messaging.listen(this._messaging.internalExchangeName, 'peer.alive', (m: Message<PeerStat>) => {
                 this._peerStatusHandler(m);
             }).catch(e => this._messaging.reportError(e)),
-            this._messaging.listen(this._messaging.getInternalExchangeName(), 'peer.alive.req', (m) => {
+            this._messaging.listen(this._messaging.internalExchangeName, 'peer.alive.req', (m) => {
                 this._logger.debug('Received peer.alive.req', m.originalMessage());
                 this._request();
             }).catch(e => this._messaging.reportError(e)),
@@ -69,7 +70,7 @@ export class PeerStatus {
                 }
             };
 
-            if (targetService !== this._messaging.getServiceName()) {
+            if (targetService !== this._messaging.serviceName) {
                 await this.listenOrProxy(targetService, 'peer.alive', messageHandler);
             } else {
                 this._proxies.push(messageHandler);
@@ -94,10 +95,6 @@ export class PeerStatus {
                 }, Math.max(latency, 1000));
             });
         });
-    }
-
-    public setElection(election: Election) {
-        this._election = election;
     }
 
     /**
@@ -133,6 +130,7 @@ export class PeerStatus {
     }
 
     private async _keepAlive() {
+        console.log('keeping alive...');
         if (this._election.TIMEOUT / 3 < 10) {
             this._logger.warn('electionTimeoutTooSmall', 'Election timeout should be at least 10ms');
         }
@@ -141,15 +139,20 @@ export class PeerStatus {
             this._timer = null;
         }
         // Security mechanic in case there is no leader
-        if (isNullOrUndefined(this._election.leaderSeen()) || this._election.leaderSeen().valueOf() < Date.now() - 60000) {
-            this._election.start().catch(e => () => {
-                // Ignored
-            });
+        if (this._election.leaderSeen() == null || this._election.leaderSeen().valueOf() < (Date.now() - 60000)) {
+            try {
+                await this._election.start();
+                console.log('election has finished');
+            } catch (e) {
+                console.log('ERROR: peer status');
+            };
         }
+
+
         this._publishAlive().catch(e => this._messaging.reportError(e));
         this._timer = setTimeout(() => {
             this._keepAlive().catch(e => this._messaging.reportError(e));
-        }, Math.max(~~(this._election.TIMEOUT / 3), 10));
+        }, Math.max(Math.floor(this._election.TIMEOUT / 3), 10));
     }
 
     private _peerStatusHandler(message: Message<PeerStat>) {
@@ -179,9 +182,9 @@ export class PeerStatus {
             return;
         }
         this._ongoingPublish = true;
-        await this._messaging.emit<PeerStat>(this._messaging.getInternalExchangeName(), 'peer.alive', {
+        await this._messaging.emit<PeerStat>(this._messaging.internalExchangeName, 'peer.alive', {
             id: this._messaging.getServiceId(),
-            name: this._messaging.getServiceName(),
+            name: this._messaging.serviceName,
             leaderId: this._election.leaderId() || null,
             isReady: this._messaging.isReady(),
             isMaster: this._messaging.getServiceId() === this._election.leaderId(),
@@ -260,7 +263,7 @@ export class PeerStatus {
     private async stopListenOrProxy(targetService: string, handler: MessageHandler) {
         // debounce
         await new Promise(resolve => setImmediate(async () => { // avoids that sync exploration of arrays stops
-            if (targetService === this._messaging.getServiceName()) {
+            if (targetService === this._messaging.serviceName) {
                 pull(this._proxies, handler);
                 resolve();
                 return;

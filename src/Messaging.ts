@@ -133,10 +133,9 @@ export class Messaging {
             this._qos.enable();
         }
 
-        this._peerStatus = new PeerStatus(this, tracer.context(`${this._serviceName}:${this._serviceId.substr(0, 10)}:peer-status`));
-        this._election = new Election(this, tracer.context(`${this._serviceName}:${this._serviceId.substr(0, 10)}:election`));
-        this._peerStatus.setElection(this._election);
         this._amqpLatency = new AMQPLatency(this);
+        this._election = new Election(this, tracer.context(`${this._serviceName}:${this._serviceId.substr(0, 10)}:election`));
+        this._peerStatus = new PeerStatus(this, tracer.context(`${this._serviceName}:${this._serviceId.substr(0, 10)}:peer-status`));
 
         Messaging.instances.push(this);
     }
@@ -156,45 +155,55 @@ export class Messaging {
         return Messaging.defaultConnectionTimeout / 30 * attempts + 1;
     }
 
-    public async assertLeader(noQueue = false): Promise<string> {
+    public async wait(ms: number) {
+        return new Promise((r, j) => setTimeout(r, ms));
+    }
+
+    public async assertLeader(): Promise<string> {
+        console.log('In assert leader');
         this._assertConnected();
         let channel = await this._assertChannel('__arbiter', true);
-        const queueName = `${this._internalExchangeName}.arbiter`;
+        const lockQueue = `${this._internalExchangeName}.lock`;
+        const leaderInfoQueue = `${this._internalExchangeName}.leaderInfo`
         try {
-            if (noQueue === true) {
-                channel = await this._assertChannel('__arbiter', true);
-                await channel.assertQueue(queueName, {exclusive: true});
-                await channel.consume(queueName, msg => {
-                    if (!msg.properties.replyTo) {
-                        return;
-                    }
-                    this._outgoingChannel.sendToQueue(
-                        msg.properties.replyTo,
-                        Buffer.from(this.getServiceId()),
-                        {
-                            contentType: 'application/json',
-                            contentEncoding: undefined,
-                            mandatory: true,
-                        },
-                    );
-                }, {noAck: true, exclusive: true});
-                return this.getServiceId();
-            } else {
-                const report = await channel.checkQueue(queueName);
-                if (report.consumerCount > 0) {
-                    return this.whoLeads();
-                } else if (!noQueue) {
-                    return this.assertLeader(true);
-                }
-            }
+            await channel.assertQueue(lockQueue, { exclusive: true });
+            await channel.assertQueue(leaderInfoQueue);
+            await this._outgoingChannel.sendToQueue(
+                lockQueue,
+                Buffer.from(this.getServiceId()),
+                {
+                    contentType: 'application/json',
+                    contentEncoding: undefined,
+                    mandatory: true,
+                },
+            );
+            // If we succeed, it means we are the leader, therefore
+            // post info so others can see who is the leader
+            await channel.purgeQueue(leaderInfoQueue);
+            console.log('WAITING NOW');
+            await this.wait(5000);
+            await this._outgoingChannel.sendToQueue(
+                leaderInfoQueue,
+                Buffer.from(this.getServiceId()),
+                {
+                    contentType: 'application/json',
+                    contentEncoding: undefined,
+                    mandatory: true,
+                },
+            )
+            console.log('IM LEADER !');
+            return this.getServiceId();
         } catch (e) {
+            console.log('ERROR');
             if (!this.isConnected()) {
                 return '';
             }
             if (/RESOURCE_LOCKED/.test(e.message)) {
+                console.log('Resource is locked, so reading info...');
                 return this.whoLeads();
             }
-            return this.assertLeader(true);
+            console.log('-- Calling again because it was another error !');
+            return this.assertLeader();
         }
     }
 
@@ -214,7 +223,8 @@ export class Messaging {
         clearTimeout(this._assertParallelChecker);
 
         this._isClosing = true;
-        await Promise.all<any>(this._ongoingQAssertion.map(p => p.promise)); // Wait that assertions still ongoing are finished before closing.
+        // Wait for ongoing assertions to be finished before closing.
+        await Promise.all<any>(this._ongoingQAssertion.map(p => p.promise));
 
         if (this._qos) {
             this._qos.disable();
@@ -315,7 +325,8 @@ export class Messaging {
             }
         });
 
-        // Should be the last assertion so that every declared bit gets opened properly and that we avoid race conditions.
+        // Should be the last assertion so that every declared bit
+        // gets opened properly and that we avoid race conditions.
         await this._assertRoutes();
         this._logger.debug('Routes asserted.');
         this._isConnecting = false;
@@ -387,13 +398,13 @@ export class Messaging {
             },
         );
         this._logger.debug('Sent event', `x.pubSub`,
-            `${target}.${route}`,
-            content.buffer.toString(),
-            {
-                contentType: 'application/json',
-                contentEncoding: content.compression,
-                headers: _headers,
-            });
+                           `${target}.${route}`,
+                           content.buffer.toString(),
+                           {
+                               contentType: 'application/json',
+                               contentEncoding: content.compression,
+                               headers: _headers,
+                           });
 
         if (ret !== true && isNullOrUndefined(this._bufferFull)) {
             this._bufferFull = new Promise(resolve => this._bufferDrained = () => resolve());
@@ -403,20 +414,21 @@ export class Messaging {
     /**
      * Access to the eventEmitter.
      */
-    public getEventEmitter() {
+    public get eventEmitter() {
         return this._eventEmitter;
     }
 
     /**
      * Get the default name used for declaring internal listen queues.
      */
-    public getInternalExchangeName() {
+    public get internalExchangeName() {
         this._assertNotClosed();
         return this._internalExchangeName;
     }
 
     /**
-     * Get the last Date object where a message was received. Does not account for internal messages.
+     * Get the last Date object where a message was received. Does not
+     * account for internal messages.
      */
     public getLastMessageDate(): Date {
         return this._lastMessageDate;
@@ -426,13 +438,20 @@ export class Messaging {
         return this._maxParallelism;
     }
 
+    public get amqpLatency() {
+        return this._amqpLatency;
+    }
+
+    public get election() {
+        return this._election;
+    }
+
     /**
      * Returns a report about the request queue of a target service
      * @param serviceName name of the service to get the report about
      * @param route name of the route for which the report needs to be generated.
-     * @returns {Promise<void>}
      */
-    public getRequestsReport(serviceName: string, route: string) {
+    public getRequestsReport(serviceName: string, route: string): Promise<RequestReport> {
         // Create a dedicated channel so that it can fail alone without annoying other channels
         return this._getQueueReport({queueName: `q.requests.${serviceName}.${route}`});
     }
@@ -447,12 +466,13 @@ export class Messaging {
     /**
      * Returns the name of the service (name supplied while instantiating the service).
      */
-    public getServiceName() {
+    public get serviceName() {
         return this._serviceName;
     }
 
     /**
-     * Getter: options sat while instantiating the service with the corresponding default values.
+     * Getter: options sat while instantiating the service with the
+     * corresponding default values.
      */
     public getServiceOptions() {
         this._assertNotClosed();
@@ -461,7 +481,9 @@ export class Messaging {
 
     /**
      * Ask for the status of a service
-     * @param targetService the service name for which a status report needs to be generated
+     *
+     * @param targetService the service name for which a status report
+     * needs to be generated
      */
     public async getStatus(targetService: string = this._serviceName): Promise<Status> {
         this._assertConnected();
@@ -476,9 +498,10 @@ export class Messaging {
     }
 
     /**
-     * Retrieve the URI to which the instance is connected. undefined when not connected yet.
+     * Retrieve the URI to which the instance is connected. undefined
+     * when not connected yet.
      */
-    public getURI() {
+    public get uri() {
         return this._uri;
     }
 
@@ -553,9 +576,9 @@ export class Messaging {
     public async listen(routeOrTarget: string, routeOrListener: any, listenerOrOptions?: any, opt?: ListenerOptions): Promise<ReturnHandler> {
         this._assertNotClosed();
         let target = routeOrTarget,
-            route = routeOrListener,
-            options = opt,
-            listener = listenerOrOptions;
+        route = routeOrListener,
+        options = opt,
+        listener = listenerOrOptions;
         if (typeof routeOrListener === 'function') {
             listener = routeOrListener;
             target = this._serviceName;
@@ -1320,7 +1343,7 @@ export class Messaging {
             route.ongoingBytes += m.size;
             if (route.ongoingBytes > route.options.maxParallelBytes) {
                 this._logger.log(`Nacking because exceeds bytes limit for a message arriving on queue ` +
-                    `${route.queueName} with ${route.ongoingBytes}B / ${route.options.maxParallelBytes}B (cTag: ${route.consumerTag})`);
+                                 `${route.queueName} with ${route.ongoingBytes}B / ${route.options.maxParallelBytes}B (cTag: ${route.consumerTag})`);
                 m.nack();
                 if (this._serviceOptions.enableQos) {
                     this.setQosMaxParallelism(0);
@@ -1335,7 +1358,7 @@ export class Messaging {
         if (route.subjectToQuota && route.maxParallelism !== -1 && route.ongoingMessages > route.maxParallelism) {
             // We don't want this message...
             this._logger.log(`Nacking because exceeds limit for a message arriving on queue ` +
-                `${route.queueName} with ${route.ongoingMessages}/${route.maxParallelism} (cTag: ${route.consumerTag})`);
+                             `${route.queueName} with ${route.ongoingMessages}/${route.maxParallelism} (cTag: ${route.consumerTag})`);
             m.nack();
             return;
         }
@@ -1348,8 +1371,8 @@ export class Messaging {
                 // throw new CustomError('inconsistency', `No handler found for response with correlationId: ${m.correlationId()}`, m);
                 this._logger.debug('A response to a request arrived but we do not have it locally. Most probably it was rejected earlier due to a timeout.');
                 this._eventEmitter.emit('unhandledMessage',
-                    new CustomError(`A response to a request arrived but we do not have it locally. Most probably it was rejected earlier due to a timeout.`),
-                    m);
+                                        new CustomError(`A response to a request arrived but we do not have it locally. Most probably it was rejected earlier due to a timeout.`),
+                                        m);
                 return; // Means it probably timed out or there is a big issue...
             }
             const defMess = this._awaitingReply.get(m.correlationId());
@@ -1503,34 +1526,18 @@ export class Messaging {
     }
 
     private async whoLeads(): Promise<string> {
-        if (!isNullOrUndefined(this._ongoingLeaderDiscovery)) {
-            return this._ongoingLeaderDiscovery;
-        }
-        return this._ongoingLeaderDiscovery = new Promise<string>(async (resolve, reject) => {
-            try {
-                const channel = await this._assertChannel('__leaderReply');
-                const leaderReplyQueue = (await channel.assertQueue('', {exclusive: true})).queue;
-                await channel.consume(leaderReplyQueue, msg => {
-                    resolve(msg.content.toString());
-                    channel.close().catch(e => this.reportError(e));
-                }, {exclusive: true, noAck: true});
-
-                const queueName = `${this._internalExchangeName}.arbiter`;
-                this._outgoingChannel.sendToQueue(
-                    queueName,
-                    Buffer.from(''),
-                    {
-                        contentType: 'application/json',
-                        contentEncoding: undefined,
-                        replyTo: leaderReplyQueue,
-                        mandatory: true,
-                    },
-                );
-
-            } catch (e) {
-                reject(e);
-            }
-            this._ongoingLeaderDiscovery = null;
+        const channel = await this._assertChannel('__leaderInfo');
+        const leaderInfoQueue = `${this._internalExchangeName}.leaderInfo`;
+        let leader;
+        console.log('lets see who is leader...');
+        await channel.consume(leaderInfoQueue, msg => {
+            console.log('leader info received, checking now !');
+            leader = msg.content.toString();
+            console.log('leader is');
+            console.log(leader);
+            channel.close().catch(e => this.reportError(e));
         });
+        console.log('returning leader', leader);
+        return leader;
     }
 }

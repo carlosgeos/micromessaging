@@ -56,10 +56,10 @@ describe('Messaging', () => {
         expect(true, 'Line should not have been reached').to.equal(false);
     });
 
-    it('expect to have a getURI method returning a string', async () => {
+    it('expect to have a uri getter method returning a string', async () => {
         const c = new Messaging('client');
         await c.connect();
-        expect(c.getURI()).to.be.a('string');
+        expect(c.uri).to.be.a('string');
     });
     it('should connect to Rabbit', async () => {
         const c = new Messaging('client');

@@ -89,7 +89,7 @@ export class Qos {
         this._lastUnderPressure = new Date();
         this._isUnderPressure = true;
         this._client.setQosMaxParallelism(0);
-        this._client.getEventEmitter().emit('pressure', {
+        this._client.eventEmitter.emit('pressure', {
             type: 'eventLoop',
             contents: status,
         });
@@ -98,7 +98,7 @@ export class Qos {
     private _elReleased(status: EventLoopStatus) {
         this._logger.log(`Event loop is now ok. Threshold set to ${this._config.eventLoopThreshold} > ${status.eventLoopDelayedByMS}. Status attached`, status);
         this._isUnderPressure = false;
-        this._client.getEventEmitter().emit('pressureReleased', {
+        this._client.eventEmitter.emit('pressureReleased', {
             type: 'eventLoop',
             contents: status,
         });
@@ -155,7 +155,7 @@ export class Qos {
         } else {
             this._isUnderPressure = true;
         }
-        this._client.getEventEmitter().emit('pressure', {
+        this._client.eventEmitter.emit('pressure', {
             type: 'memory',
             contents: status,
         });
@@ -165,7 +165,7 @@ export class Qos {
         this._logger.log(`Memory went below softLimit of ${this._config.memorySoftLimit / Math.pow(2, 20)}MB. History attached.`, status);
         this._shouldStopReceiving = false;
         this._isUnderPressure = false;
-        this._client.getEventEmitter().emit('pressureReleased', {
+        this._client.eventEmitter.emit('pressureReleased', {
             type: 'memory',
             contents: status,
         });

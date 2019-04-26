@@ -27,7 +27,9 @@ export class Election {
     }
 
     /**
-     * Sets the last date the leader was seen
+     * Sets the last date the leader was seen and returns
+     * null. Otherwise (no param), returns the Date object or
+     * undefined
      */
     public leaderSeen(date?: Date) {
         if (!date) {
@@ -53,14 +55,14 @@ export class Election {
         if (!this._messaging.isConnected() || isNullOrUndefined(this._leaderId) || this._leaderId === prevLeader) {
             return;
         }
-        this._messaging.getEventEmitter().emit('leader', {leaderId: this._leaderId});
+        this._messaging.eventEmitter.emit('leader', {leaderId: this._leaderId});
         if (this._leaderId === this._messaging.getServiceId() && !this._wasLeader) {
             this._wasLeader = true;
-            this._messaging.getEventEmitter().emit('leader.stepUp', {leaderId: this._leaderId});
+            this._messaging.eventEmitter.emit('leader.stepUp', {leaderId: this._leaderId});
         }
         if (this._leaderId !== this._messaging.getServiceId() && this._wasLeader) {
             this._wasLeader = false;
-            this._messaging.getEventEmitter().emit('leader.stepDown', {leaderId: this._leaderId});
+            this._messaging.eventEmitter.emit('leader.stepDown', {leaderId: this._leaderId});
         }
     }
 }
