@@ -47,6 +47,7 @@ export class Messaging {
     public static instances: Messaging[] = [];
     public static internalExchangePrefix = 'internal';
     public latencyMS: number;
+    public ongoingLeaderDiscovery: boolean;
     private _amqpLatency: AMQPLatency;
     private _assertParallelChecker: Timer;
     private _awaitingReply: Map<string, ReplyAwaiter> = new Map();
@@ -54,11 +55,6 @@ export class Messaging {
     private _bufferFull: Promise<void>;
     private _channels: Map<string, Channel> = new Map();
     private _connection: Connection;
-    /**
-     * Connects to a rabbit instance. Idempotent.
-     * @param rabbitURI format: amqp://localhost?heartbeat=30 — If heartbeat is not supplied, will default to 30s
-     * @returns Returns once the connection is properly initialized and that all listeners and handlers have been fully declared.
-     */
     private _connectionAttempts = 0;
     // private _serviceId: string = '' + (++ID);
     private _election: Election;
@@ -77,7 +73,6 @@ export class Messaging {
     private _lastTimeConnected = new Date().valueOf();
     private _logger: Logger;
     private _maxParallelism: number = -1;
-    private _ongoingLeaderDiscovery: Promise<string>;
     private _ongoingQAssertion: Deferred<void>[] = [];
     private _outgoingChannel: Channel;
     private _peerStatus: PeerStatus;
@@ -102,7 +97,9 @@ export class Messaging {
 
     /**
      * @param {string} _serviceName
-     * @param options memorySoftLimit and memoryHardLimit respectively defaults to half and 3/5 of heap_size_limit. Expressed in MB.
+     *
+     * @param options memorySoftLimit and memoryHardLimit respectively
+     * defaults to half and 3/5 of heap_size_limit. Expressed in MB.
      */
     constructor(private _serviceName: string, {
         readyOnConnected = true,
@@ -159,61 +156,62 @@ export class Messaging {
         return new Promise((r, j) => setTimeout(r, ms));
     }
 
-    public async assertLeader(): Promise<string> {
-        console.log('In assert leader');
+    /**
+     * Tries to get the lock on the exclusive queue and tells every
+     * other Messaging service consuming the election news about the
+     * new result
+     */
+    public async assertLeader(): Promise<void> {
+        console.log(this.serviceId, 'In assert leader');
+        console.log('when');
         this._assertConnected();
-        let channel = await this._assertChannel('__arbiter', true);
+        const channel = await this.assertChannel('__election', true);
         const lockQueue = `${this._internalExchangeName}.lock`;
-        const leaderInfoQueue = `${this._internalExchangeName}.leaderInfo`
+        console.log('when2');
         try {
+            const leaderInfoExchange = `${this.internalExchangeName}.leaderInfo`;
+            console.log(this.serviceId, 'when3');
             await channel.assertQueue(lockQueue, { exclusive: true });
-            await channel.assertQueue(leaderInfoQueue);
+            console.log(this.serviceId, 'when4');
+            await channel.assertExchange(leaderInfoExchange, 'fanout');
+            console.log('when5');
             await this._outgoingChannel.sendToQueue(
                 lockQueue,
-                Buffer.from(this.getServiceId()),
+                Buffer.from(''),
                 {
                     contentType: 'application/json',
                     contentEncoding: undefined,
                     mandatory: true,
                 },
             );
-            // If we succeed, it means we are the leader, therefore
-            // post info so others can see who is the leader
-            await channel.purgeQueue(leaderInfoQueue);
-            console.log('WAITING NOW');
-            await this.wait(5000);
-            await this._outgoingChannel.sendToQueue(
-                leaderInfoQueue,
-                Buffer.from(this.getServiceId()),
-                {
-                    contentType: 'application/json',
-                    contentEncoding: undefined,
-                    mandatory: true,
-                },
-            )
-            console.log('IM LEADER !');
-            return this.getServiceId();
+            this._election.leaderId = this.serviceId;
+            console.log(this.serviceId, 'IM LEADER ! Leader info published');
         } catch (e) {
-            console.log('ERROR');
+            console.log(this.serviceId, 'ERROR');
             if (!this.isConnected()) {
-                return '';
+                return;
             }
             if (/RESOURCE_LOCKED/.test(e.message)) {
-                console.log('Resource is locked, so reading info...');
-                return this.whoLeads();
+                // Someone else got here before
+                console.log(this.serviceId, 'SOME ONE ELSE GOT HERE BEFORE');
+            } else {
+                console.log('Some other error...');
             }
-            console.log('-- Calling again because it was another error !');
-            return this.assertLeader();
+            // There can be other errors (channels are closing,
+            // channels are closed, etc), we simply ignore it
         }
     }
 
     /**
-     * Cleanly closes the connection to Rabbit and removes all handlers. Request queue is not deleted.
+     * Cleanly closes the connection to Rabbit and removes all
+     * handlers. Request queue is not deleted.
+     *
      * @param deleteAllQueues Delete queues only if empty and not used.
      * @param force Forces deletion (no check on ifEmpty & ifUnused).
      * @returns Promise that resolves once the connection has been fully closed.
      */
     public async close(deleteAllQueues: boolean = false, force: boolean = false) {
+        console.log('!!! GENERAL CLOSE CALLED !!!! ');
         if (this._isClosed || this._isClosing) {
             // Close is idempotent
             return;
@@ -278,6 +276,15 @@ export class Messaging {
         pull(Messaging.instances, this);
     }
 
+    /**
+     * Connects to a rabbit instance. Idempotent.
+     *
+     * @param rabbitURI format: amqp://localhost?heartbeat=30 — If
+     * heartbeat is not supplied, will default to 30s
+     *
+     * @returns Returns once the connection is properly initialized
+     * and that all listeners and handlers have been fully declared.
+     */
     public async connect(rabbitURI?: string): Promise<void> {
         this._assertNotClosed();
         if (this._isConnected || this._isConnecting) {
@@ -452,14 +459,13 @@ export class Messaging {
      * @param route name of the route for which the report needs to be generated.
      */
     public getRequestsReport(serviceName: string, route: string): Promise<RequestReport> {
-        // Create a dedicated channel so that it can fail alone without annoying other channels
         return this._getQueueReport({queueName: `q.requests.${serviceName}.${route}`});
     }
 
     /**
      * Get the UUID generated for this instance.
      */
-    public getServiceId() {
+    public get serviceId() {
         return this._serviceId;
     }
 
@@ -488,7 +494,7 @@ export class Messaging {
     public async getStatus(targetService: string = this._serviceName): Promise<Status> {
         this._assertConnected();
         const members = await this._peerStatus.getStatus(targetService);
-        const hasMaster = members.some(m => !isNullOrUndefined(m.leaderId));
+        const hasMaster = members.some(m => m.leaderId != null);
         const hasReadyMembers = members.some(m => !isNullOrUndefined(m.isReady));
         return {
             hasMaster,
@@ -588,7 +594,7 @@ export class Messaging {
 
         const routeAlias = `listen.${target}.${route}`;
 
-        if (!isNullOrUndefined(this._routes.get(routeAlias))) {
+        if (this._routes.get(routeAlias) != null) {
             throw new CustomError(`A listener for ${isNullOrUndefined(target) ? '' : target + ':'}${route} is already defined.`);
         }
         this._routes.set(routeAlias, {
@@ -942,14 +948,19 @@ export class Messaging {
         return;
     }
 
-    private async _assertChannel(name: string, swallowErrors: boolean = false): Promise<Channel> {
+    public async assertChannel(name: string, swallowErrors: boolean = false): Promise<Channel> {
+        console.log(this.serviceId, 'asserting channel', name);
         if (this._channels.has(name)) {
             return this._channels.get(name);
         }
         const newChan = await this._createChannel();
         newChan.on('close', () => {
+            console.log('channel closed');
             this._channels.delete(name);
         });
+
+        // The following avoids crashes when an error is intended
+        // behaviour
         if (swallowErrors) {
             newChan.removeAllListeners('error');
             newChan.on('error', noop);
@@ -1134,7 +1145,7 @@ export class Messaging {
                 if (route.consumerTag === 'pending') {
                     await route.consumerWaiter;
                 }
-                if (!isNullOrUndefined(route.consumerTag) && route.isReady) {
+                if (route.consumerTag != null && route.isReady) {
                     const consumerTag = route.consumerTag;
                     route.consumerTag = null;
                     await (route.isCancelling = route.channel.cancel(consumerTag));
@@ -1296,9 +1307,8 @@ export class Messaging {
                 }
             }
         });
-        // chan.on('close', () => {
-        //     // this._logger.log('Channel closed');
-        // });
+        // The 'close' hook is set in assertChannel, since it is more
+        // convenient to keep track of which channels are still alive
         return chan;
     }
 
@@ -1307,7 +1317,7 @@ export class Messaging {
             queueName = this._routes.get(routeAlias).queueName;
         }
         // Create a dedicated channel so that it can fail alone without annoying other channels
-        const channel = await this._assertChannel('__requestReport', true);
+        const channel = await this.assertChannel('__requestReport', true);
         try {
             const report = await channel.checkQueue(queueName);
             return {
@@ -1436,6 +1446,7 @@ export class Messaging {
     }
 
     private _stopListen(routeName: string): (options?: ReturnHandlerStopOpts) => Promise<void> {
+        console.log('!!! STOP LISTEN CALLED !!!');
         return async ({deleteQueue = true}: ReturnHandlerStopOpts = {}) => {
             if (!this._routes.has(routeName)) {
                 throw new CustomError('notFound', `The route ${routeName} does not exist.`);
@@ -1454,7 +1465,7 @@ export class Messaging {
             if (route.type === 'pubSub') {
                 await route.channel.unbindQueue(route.queueName, 'x.pubSub', `${route.target}.${route.route}`);
             }
-            if (!isNullOrUndefined(route.isCancelling)) {
+            if (route.isCancelling != null) {
                 await route.isCancelling;
             }
             await route.channel.close();
@@ -1523,21 +1534,5 @@ export class Messaging {
             }
             this._awaitingReply.delete(correlationId);
         }
-    }
-
-    private async whoLeads(): Promise<string> {
-        const channel = await this._assertChannel('__leaderInfo');
-        const leaderInfoQueue = `${this._internalExchangeName}.leaderInfo`;
-        let leader;
-        console.log('lets see who is leader...');
-        await channel.consume(leaderInfoQueue, msg => {
-            console.log('leader info received, checking now !');
-            leader = msg.content.toString();
-            console.log('leader is');
-            console.log(leader);
-            channel.close().catch(e => this.reportError(e));
-        });
-        console.log('returning leader', leader);
-        return leader;
     }
 }
